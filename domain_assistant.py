@@ -243,27 +243,58 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
+    def __init__(self, max_output_tokens: int = 400) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        for attempt in range(6):
+            try:
+                try:
+                    response = self.client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    )
+                    answer = response.output_text.strip()
+                except Exception:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=self.max_output_tokens,
+                    )
+                    msg = response.choices[0].message
+                    content = msg.content or getattr(msg, "reasoning", "") or getattr(msg, "reasoning_content", "") or ""
+                    if "</think>" in content:
+                        content = content.split("</think>")[-1]
+                    answer = content.strip()
+                if not answer:
+                    raise RuntimeError("OpenAI returned an empty answer")
+                return answer
+            except Exception as e:
+                err_str = str(e)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "rate_limit" in err_str.lower() or "rate limit" in err_str.lower()) and attempt < 5:
+                    delay = 20.0
+                    delay_match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str)
+                    if delay_match:
+                        delay = float(delay_match.group(1)) + 3.0
+                    time.sleep(delay)
+                elif ("timeout" in err_str.lower() or "timed out" in err_str.lower() or "connection" in err_str.lower() or "empty answer" in err_str.lower()) and attempt < 5:
+                    time.sleep(5.0)
+                elif attempt < 5:
+                    time.sleep(5.0)
+                else:
+                    raise
+        raise RuntimeError("Failed to generate response after retries")
 
 
 @dataclass(frozen=True)
@@ -405,12 +436,34 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    output_path = Path("artifacts/actual_answers.json")
+    existing_answers: dict[str, dict[str, Any]] = {}
+    if output_path.exists():
+        try:
+            cached_data = json.loads(output_path.read_text(encoding="utf-8"))
+            if isinstance(cached_data, dict) and "answers" in cached_data:
+                for a in cached_data["answers"]:
+                    if isinstance(a, dict) and a.get("id") and a.get("actual_answer"):
+                        existing_answers[a["id"]] = a
+        except Exception:
+            pass
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
         percentage = index / total
         completed_before = index - 1
         filled_before = round(20 * completed_before / total)
         bar_before = "#" * filled_before + "-" * (20 - filled_before)
+        filled_after = round(20 * percentage)
+        bar_after = "#" * filled_after + "-" * (20 - filled_after)
+
+        if item["id"] in existing_answers:
+            answers.append(existing_answers[item["id"]])
+            notify(
+                f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} Cached OK"
+            )
+            continue
+
         question_preview = re.sub(r"\s+", " ", item["question"]).strip()
         if len(question_preview) > 58:
             question_preview = f"{question_preview[:55]}..."
@@ -444,13 +497,12 @@ def generate_actual_answers(
             }
         )
 
-        filled_after = round(20 * percentage)
-        bar_after = "#" * filled_after + "-" * (20 - filled_after)
         elapsed = time.perf_counter() - started_at
         notify(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(1.0)
 
     return {
         "schema_version": "1.0",
